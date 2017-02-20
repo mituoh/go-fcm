@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"time"
 )
@@ -39,6 +40,7 @@ var (
 type FcmClient struct {
 	ApiKey  string
 	Message FcmMsg
+	Client  *http.Client
 }
 
 // FcmMsg represents fcm request message
@@ -88,9 +90,30 @@ type NotificationPayload struct {
 }
 
 // NewFcmClient init and create fcm client
-func NewFcmClient(apiKey string) *FcmClient {
+func NewFcmClient(apiKey string, client *http.Client) *FcmClient {
 	fcmc := new(FcmClient)
 	fcmc.ApiKey = apiKey
+
+	if client == nil {
+		var tr *http.Transport
+		tr = &http.Transport{
+			DisableKeepAlives: true, // https://code.google.com/p/go/issues/detail?id=3514
+			Dial: func(network, address string) (net.Conn, error) {
+				start := time.Now()
+				timeoutDuration := 30 * time.Second
+				c, err := net.DialTimeout(network, address, timeoutDuration)
+				tr.ResponseHeaderTimeout = timeoutDuration - time.Since(start)
+				return c, err
+			},
+		}
+
+		client = &http.Client{
+			Transport:     tr,
+			CheckRedirect: redirectPreserveHeaders,
+		}
+	}
+
+	fcmc.Client = client
 
 	return fcmc
 }
@@ -109,6 +132,27 @@ func (this *FcmClient) NewFcmMsgTo(to string, body interface{}) *FcmClient {
 	this.Message.Data = body
 
 	return this
+}
+
+// Preserve headers on redirect.
+//
+// Reference https://github.com/golang/go/issues/4800
+func redirectPreserveHeaders(req *http.Request, via []*http.Request) error {
+	if len(via) == 0 {
+		// No redirects
+		return nil
+	}
+
+	var defaultRedirectLimit = 30
+	if len(via) > defaultRedirectLimit {
+		return fmt.Errorf("%d consecutive requests(redirects)", len(via))
+	}
+
+	// mutate the subsequent redirect requests with the first Header
+	for key, val := range via[0].Header {
+		req.Header[key] = val
+	}
+	return nil
 }
 
 // SetMsgData sets data payload
@@ -165,8 +209,7 @@ func (this *FcmClient) sendOnce() (*FcmResponseStatus, error) {
 	request.Header.Set("Authorization", this.apiKeyHeader())
 	request.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{}
-	response, err := client.Do(request)
+	response, err := this.Client.Do(request)
 
 	if err != nil {
 		return fcmRespStatus, err
